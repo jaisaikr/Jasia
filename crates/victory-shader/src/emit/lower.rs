@@ -4375,6 +4375,12 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // A structured buffer is a raw view on the host (`emit`, "Structured
+        // buffers"): its size comes in bytes, the console's in elements.
+        let (props, per_element) = match props {
+            (kind, stride) if kind & 0xFF == 12 => ((11 | (kind & 0x1000), 0), Some(stride)),
+            props => (props, None),
+        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4425,7 +4431,17 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let size = field(self, 0);
+                let size = match per_element {
+                    Some(stride) => {
+                        let stride = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, size, stride)
+                    }
+                    None => size,
+                };
+                vec![(2, size)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -9545,11 +9561,13 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    // Structured buffers are raw views on the host, addressed
+                    // by byte (`emit`, "Structured buffers").
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
                     let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    let (h, byte) = self.raw_view(site, src, byte, 4, (11 | u, 0), true, guard)?;
+                    (h, [byte, iu, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9698,11 +9716,14 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                        let s = self.s.m.i32(stride);
+                        // A raw view on the host, addressed by byte
+                        // (`emit`, "Structured buffers").
+                        let (n, s) = (4 * count, self.s.m.i32(stride));
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let at = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        let (h, at) = self.raw_view(site, src, at, n, (11 | u, 0), true, guard)?;
+                        args.extend([h, at, iu]);
+                        (byte, bytes) = (at, n);
                     }
                     None => {
                         let n = 4 * count;
@@ -9802,36 +9823,30 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            match index {
+            // A structured buffer is a raw view on the host, addressed by
+            // byte (`emit`, "Structured buffers").
+            let off = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, s);
+                    self.s.m.bin(c, Bin::Add, row, off)
                 }
-                None => {
-                    let bytes = 4 * count;
-                    let (h, off) =
-                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
-                    self.s.op(
-                        self.cur,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
+                None => off,
+            };
+            let bytes = 4 * count;
+            let (h, off) = self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
+            self.s.op(
+                self.cur,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, off, iu, mask, align],
+            )
         };
         let c = self.cur;
         let Some(Operand::Vector { reg, .. }) = *data else {

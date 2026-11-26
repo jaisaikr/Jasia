@@ -29,8 +29,10 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// indices"). Views: the D3D12 limit for shader-visible view heaps on
+/// binding tiers 1 and 2, which NVIDIA caps tier 3 heaps at too (2^21 left
+/// the null buffer views out of NVIDIA's heaps).
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that

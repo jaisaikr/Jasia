@@ -86,7 +86,7 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+const PORTABLE_VIEWS: u32 = victory_shader::emit::HEAP_VIEWS;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -1185,7 +1185,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_align(view))?;
     Some((shadow, address, len))
 }
 
@@ -1231,15 +1231,27 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let raw = host_raw(buffer.StructureByteStride, buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0);
+    let bytes = u64::from(buffer.NumElements) * element;
+    let Some((shadow, own)) = crate::shadow::for_view(start, bytes, copy_align(raw, element)) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
         }
         return None;
     };
+    let element = if raw {
+        // Raw on the host: dwords from the copy's 16-byte aligned start.
+        buffer.NumElements = u32::try_from(bytes / 4).ok()?;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        4
+    } else {
+        element
+    };
+    // SAFETY: as above.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
@@ -1271,6 +1283,47 @@ fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
     count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
 }
 
+/// Whether the host views a title buffer view of this structure stride
+/// and raw flag as a raw buffer: raw views, and structured views whose
+/// stride is a whole number of dwords. Translated shaders address
+/// structured buffers by byte through raw handles (`victory_shader::emit`,
+/// "Structured buffers"); a raw load through a structured descriptor is
+/// undefined, and NVIDIA scales the address by the stride.
+fn host_raw(stride: u32, raw: bool) -> bool {
+    raw || (stride > 0 && stride.is_multiple_of(4))
+}
+
+/// The alignment a view's bytes need in their host copy: a raw view's
+/// start 16 bytes (D3D12), anything else a whole number of elements.
+fn copy_align(raw: bool, element: u64) -> u64 {
+    if raw { u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) } else { element }
+}
+
+/// [`copy_align`] of a view, as `make` places it: [`crate::shadow::for_view`]
+/// finds the copy by it.
+fn view_align(view: &View) -> u64 {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return copy_align(true, 4),
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    let (stride, raw) = if unordered {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { uav_desc(words).Anonymous.Buffer };
+        (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0)
+    } else {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { srv_desc(words).Anonymous.Buffer };
+        (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0)
+    };
+    copy_align(host_raw(stride, raw), u64::from(view_stride(view)))
+}
+
 /// An unordered access view of title buffer memory at `address` (`len`
 /// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
 /// written by shaders (upload memory).
@@ -1296,13 +1349,27 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let raw = host_raw(buffer.StructureByteStride, buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0);
+    let bytes = u64::from(buffer.NumElements) * element;
+    let (shadow, own) = crate::shadow::for_view(start, bytes, copy_align(raw, element))?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
+    let element = if raw {
+        // Raw on the host: dwords from the copy's 16-byte aligned start.
+        buffer.NumElements = u32::try_from(bytes / 4).ok()?;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        4
+    } else {
+        element
+    };
+    // SAFETY: as above.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);

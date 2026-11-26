@@ -3569,9 +3569,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    /// A structured view the title places off its buffer's elements (the
-    /// culling constants at a ring position) is made over a copy of its own
-    /// bytes; one on an element views the buffer's copy.
+    /// A structured view, raw on the host (`victory_shader::emit`,
+    /// "Structured buffers"), that the title places off 16 bytes of its
+    /// buffer's copy (the culling constants at a ring position; a raw view
+    /// starts 16-byte aligned) is made over a copy of its own bytes; one on
+    /// 16 bytes views the buffer's copy, on an element or not.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
         let Some(host) = crate::host::host() else {
@@ -3605,7 +3607,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 912), 1 << 16, "on an element and 16 bytes: the buffer's copy");
+        assert_eq!(width(start + 48), 1 << 16, "on 16 bytes off an element: the buffer's copy");
+        assert_ne!(width(start + 456), 1 << 16, "on an element off 16 bytes: a copy of its own bytes");
         assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
@@ -3622,7 +3626,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make_at(0, &view(start + 100));
         let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
         for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
+            if (100 + 4 * k) % 16 != 0 {
                 crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
             }
         }
