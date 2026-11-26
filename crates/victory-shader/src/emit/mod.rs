@@ -88,6 +88,14 @@
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
 //!   reads nothing instead of faulting the device.
+//! * **Structured buffers** (added 2026-11-26) are raw views on the host:
+//!   `victory_gpu` makes a title's structured view (a stride of whole
+//!   dwords) a raw one over the same bytes, and shaders address it by byte
+//!   (element × stride + offset) through raw handles, as the console's
+//!   descriptors do. A raw load through a structured descriptor is
+//!   undefined in D3D12: AMD and WARP ignore the stride, NVIDIA scales the
+//!   address by it. Size queries divide the raw view's bytes by the stride
+//!   (the console counts a structured buffer's records in elements).
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV

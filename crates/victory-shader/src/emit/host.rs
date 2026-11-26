@@ -1787,6 +1787,14 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
+                            // As `victory_gpu` makes it: a raw view over the
+                            // same bytes (`emit`, "Structured buffers").
+                            Stride::Structured(s) if s.is_multiple_of(4) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
+                            ),
                             Stride::Structured(s) => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / s as usize,
@@ -1919,6 +1927,10 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    // No values: nothing to set. An empty `Vec`'s pointer is
+                    // dangling, and NVIDIA's driver reads it even for a count
+                    // of 0 (an access violation; WARP does not).
+                    Root::Constants(data) if data.is_empty() => {}
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
